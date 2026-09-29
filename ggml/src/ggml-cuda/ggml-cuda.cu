@@ -3448,6 +3448,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_GET_ROWS) {
+        ggml_cuda_top_k_qsa_match match;
+        if (ggml_cuda_match_top_k_qsa(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                ggml_cuda_op_top_k_qsa(*cuda_ctx, match);
+                return match.node_count - 1;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -4539,6 +4550,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_top_k_qsa_match qsa;
+            if (ggml_cuda_match_top_k_qsa(cgraph, i, qsa)) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.scores), qsa.dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.cells), qsa.dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.mask), qsa.dst);
+                i += qsa.node_count - 1;
+                continue;
+            }
+
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);

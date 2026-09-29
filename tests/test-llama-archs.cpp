@@ -24,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+static bool test_flash_attn = false;
+
 static bool arch_matches(const std::string & filter, llm_arch arch) {
     if (filter.empty()) {
         return true;
@@ -99,6 +101,7 @@ static void usage(char ** argv) {
     LOG("  --decode-one    Compare one decode token after prefill\n");
     LOG("  --cache-qsa-indexer Test eight decode steps and state restoration with pooled keys\n");
     LOG("  --sparse-indexer Use a 32-token indexer budget in backend tests\n");
+    LOG("  --flash-attn Force Flash Attention in backend tests\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -484,6 +487,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.offload_kqv = !cpu_kv;
     ctx_params.keep_recurrent_on_device = keep_recurrent_on_device;
     ctx_params.cache_qsa_indexer = cache_qsa_indexer;
+    if (test_flash_attn) {
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
     ctx_params.n_rs_seq = cache_qsa_indexer || rollback_snapshots ? 1 : 0;
     if (!encode) {
         ctx_params.n_ubatch = 64;
@@ -997,6 +1003,8 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
+        } else if (strcmp(argv[i], "--flash-attn") == 0) {
+            test_flash_attn = true;
         } else if (strcmp(argv[i], "--sparse-indexer") == 0) {
             indexer_top_k = 32;
         } else if (strcmp(argv[i], "--decode-one") == 0) {

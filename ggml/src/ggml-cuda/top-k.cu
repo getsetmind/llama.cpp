@@ -1,6 +1,9 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <type_traits>
+#include <atomic>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
@@ -12,8 +15,9 @@ using namespace cub;
 
 #ifdef CUB_TOP_K_AVAILABLE
 
+template<typename Input>
 static void top_k_cub(ggml_cuda_pool & pool,
-                      const float *    src,
+                      Input            src,
                       int *            dst,
                       const int        ncols,
                       const int        k,
@@ -271,5 +275,173 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
     }
 #endif // defined(GGML_USE_HIP)
+#endif
+}
+
+bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_top_k_qsa_match & match) {
+#ifdef CUB_TOP_K_AVAILABLE
+    static const bool enabled = getenv("GGML_CUDA_QSA_TOP_K") != nullptr && std::atoi(getenv("GGML_CUDA_QSA_TOP_K")) != 0;
+    if (!enabled) {
+        return false;
+    }
+    static const bool diagnose = getenv("GGML_CUDA_QSA_TOP_K_DIAG") != nullptr;
+    static std::atomic<int> diagnostics { 0 };
+    if (diagnose && graph->nodes[index]->op == GGML_OP_GET_ROWS &&
+            graph->nodes[index]->src[0]->type == GGML_TYPE_F32 && graph->nodes[index]->src[0]->ne[0] <= 128 &&
+            diagnostics.fetch_add(1) < 4) {
+        GGML_LOG_INFO("qsa_match_diag: scores=%lld,%lld,%lld cells=%lld\n",
+            (long long) graph->nodes[index]->src[0]->ne[0], (long long) graph->nodes[index]->src[0]->ne[1],
+            (long long) graph->nodes[index]->src[0]->ne[2], (long long) graph->nodes[index]->src[1]->ne[0]);
+        for (int offset = 0; offset < 8 && index + offset < graph->n_nodes; ++offset) {
+            const ggml_tensor * node = graph->nodes[index + offset];
+            GGML_LOG_INFO("qsa_match_diag: offset=%d op=%s flags=%d uses=%d name=%s\n", offset,
+                ggml_op_name(node->op), node->flags, ggml_node_get_use_count(graph, index + offset), node->name);
+        }
+    }
+    if (index + 4 >= graph->n_nodes) {
+        return false;
+    }
+    const std::initializer_list<ggml_op> cast_ops = {
+        GGML_OP_GET_ROWS, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_CPY,
+        GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_TOP_K,
+    };
+    const std::initializer_list<ggml_op> reshape_ops = {
+        GGML_OP_GET_ROWS, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_TOP_K,
+    };
+    const std::initializer_list<ggml_op> ready_ops = {
+        GGML_OP_GET_ROWS, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_TOP_K,
+    };
+    const ggml_op mask_op = graph->nodes[index + 3]->op;
+    const auto ops = mask_op == GGML_OP_CPY ? cast_ops : mask_op == GGML_OP_RESHAPE ? reshape_ops : ready_ops;
+    const int last = index + (int) ops.size() - 1;
+    if (last >= graph->n_nodes) {
+        return false;
+    }
+    for (int offset = 0; offset < (int) ops.size(); ++offset) {
+        const ggml_tensor * node = graph->nodes[index + offset];
+        if (node->op != ops.begin()[offset] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        // castのCPYは自身の書込先参照を含むので、外部への参照と区別する
+        if (offset < (int) ops.size() - 1 && ((node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+                ggml_node_get_use_count(graph, index + offset) != (node->op == GGML_OP_CPY ? 2 : 1))) {
+            return false;
+        }
+    }
+    if (!ggml_check_edges(graph, index, { { 1, 0, 0 }, { 2, 0, 1 } })) {
+        return false;
+    }
+    const ggml_tensor * gather = graph->nodes[index];
+    const ggml_tensor * scores = gather->src[0];
+    const ggml_tensor * cells = gather->src[1];
+    const ggml_tensor * expanded = graph->nodes[index + 2];
+    const ggml_tensor * add = graph->nodes[last - 1];
+    ggml_tensor * dst = graph->nodes[last];
+    if (add->src[0] != expanded || dst->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * mask = add->src[1];
+    if (ops.size() != ready_ops.size()) {
+        const ggml_tensor * reshaped = graph->nodes[last - 2];
+        if (mask != reshaped) {
+            return false;
+        }
+        mask = reshaped->src[0];
+    }
+    // maskのcastがCPUへ割り当てられた場合は、転送済みF32をそのまま読む
+    if (ops.size() == cast_ops.size()) {
+        const ggml_tensor * cast = graph->nodes[index + 3];
+        if (mask != cast || cast->type != GGML_TYPE_F32 || cast->src[0]->type != GGML_TYPE_F16) {
+            return false;
+        }
+        mask = cast->src[0];
+    } else if (mask->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (scores->type != GGML_TYPE_F32 || cells->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(scores) || !ggml_is_contiguous(cells) || !ggml_is_contiguous(mask) ||
+            !ggml_is_contiguous(expanded) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const int64_t n_tokens = scores->ne[0];
+    const int64_t n_blocks = scores->ne[1];
+    const int64_t n_streams = scores->ne[2];
+    const int64_t n_cells = cells->ne[0];
+    if (scores->ne[3] != 1 || cells->ne[1] != n_streams || ggml_nrows(cells) != n_streams ||
+            n_tokens <= 0 || n_blocks <= 0 || n_cells <= 0 || n_cells > INT_MAX ||
+            ggml_nelements(mask) != n_cells*n_tokens*n_streams ||
+            expanded->ne[0] != n_cells || expanded->ne[1] != n_tokens || expanded->ne[2] != n_streams || expanded->ne[3] != 1 ||
+            !ggml_are_same_shape(expanded, add->src[1]) || !ggml_are_same_shape(expanded, add) ||
+            dst->ne[1] != n_tokens || dst->ne[2] != n_streams || dst->ne[3] != 1 || dst->ne[0] <= 0 || dst->ne[0] > n_cells) {
+        return false;
+    }
+    // 展開後のcell軸とtoken軸が入れ替わっていることをstrideで確認する
+    const ggml_tensor * permuted = graph->nodes[index + 1];
+    if (permuted->ne[0] != n_cells || permuted->ne[1] != n_tokens || permuted->ne[2] != n_streams ||
+            permuted->nb[0] != gather->nb[1] || permuted->nb[1] != gather->nb[0] || permuted->nb[2] != gather->nb[2]) {
+        return false;
+    }
+    match = { scores, cells, mask, dst, (int) ops.size() };
+    return true;
+#else
+    GGML_UNUSED(graph);
+    GGML_UNUSED(index);
+    GGML_UNUSED(match);
+    return false;
+#endif
+}
+
+#ifdef CUB_TOP_K_AVAILABLE
+template<typename Mask>
+struct qsa_score_at_cell {
+    const float * scores;
+    const int32_t * cells;
+    const Mask * mask;
+    int64_t token_stride;
+
+    __host__ __device__ float operator()(int cell) const {
+        const float score = scores[(int64_t) cells[cell]*token_stride];
+        if constexpr (std::is_same<Mask, half>::value) {
+            return score + __half2float(mask[cell]);
+        } else {
+            return score + mask[cell];
+        }
+    }
+};
+
+template<typename Mask>
+static void top_k_qsa_cuda(ggml_backend_cuda_context & ctx, const ggml_cuda_top_k_qsa_match & match) {
+    const int64_t n_tokens = match.scores->ne[0];
+    const int64_t n_blocks = match.scores->ne[1];
+    const int64_t n_cells = match.cells->ne[0];
+    const int64_t width = match.dst->ne[0];
+    for (int64_t stream = 0; stream < match.scores->ne[2]; ++stream) {
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            const int64_t row = stream*n_tokens + token;
+            qsa_score_at_cell<Mask> transform {
+                (const float *) match.scores->data + stream*n_blocks*n_tokens + token,
+                (const int32_t *) match.cells->data + stream*n_cells,
+                (const Mask *) match.mask->data + row*n_cells,
+                n_tokens,
+            };
+            auto input = cuda::make_transform_iterator(cuda::make_counting_iterator(0), transform);
+            top_k_cub(ctx.pool(), input, (int *) match.dst->data + row*width, (int) n_cells, (int) width, ctx.stream());
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
+
+void ggml_cuda_op_top_k_qsa(ggml_backend_cuda_context & ctx, const ggml_cuda_top_k_qsa_match & match) {
+#ifdef CUB_TOP_K_AVAILABLE
+    if (match.mask->type == GGML_TYPE_F16) {
+        top_k_qsa_cuda<half>(ctx, match);
+    } else {
+        top_k_qsa_cuda<float>(ctx, match);
+    }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(match);
+    GGML_ABORT("QSA top-k requires CUB DeviceTopK");
 #endif
 }

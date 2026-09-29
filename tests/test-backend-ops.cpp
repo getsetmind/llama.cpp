@@ -6852,7 +6852,12 @@ struct test_topk_qsa : public test_case {
     const int64_t n_tps;
     const int64_t n_stream;
     const int     width;
+    const bool    masked_ties;
+    const ggml_type mask_type;
     ggml_tensor * out {};
+    ggml_tensor * scores {};
+    ggml_tensor * cells {};
+    ggml_tensor * mask {};
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6860,11 +6865,13 @@ struct test_topk_qsa : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_blocks, n_kv, n_tps, n_stream, width);
+        return VARS_TO_STR7(n_blocks, n_kv, n_tps, n_stream, width, masked_ties, mask_type);
     }
 
-    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500)
-        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width) {}
+    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1,
+            int width = 1500, bool masked_ties = false, ggml_type mask_type = GGML_TYPE_F16)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width),
+          masked_ties(masked_ties), mask_type(mask_type) {}
 
     double max_err() override { return 0.0; }
     bool run_whole_graph() override { return true; }
@@ -6874,13 +6881,16 @@ struct test_topk_qsa : public test_case {
         ggml_set_name(score, "score");
         ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
         ggml_set_name(cell_blk, "cell_blk");
-        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_tps, n_stream);
+        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, mask_type, n_kv, n_tps, n_stream);
         ggml_set_name(kq_mask, "kq_mask");
+        scores = score;
+        cells = cell_blk;
+        mask = kq_mask;
 
         ggml_tensor * a = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
         ggml_tensor * e = ggml_get_rows(ctx, a, cell_blk);
         e = ggml_cont(ctx, ggml_permute(ctx, e, 1, 0, 2, 3));
-        ggml_tensor * m = ggml_cast(ctx, kq_mask, GGML_TYPE_F32);
+        ggml_tensor * m = mask_type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx, kq_mask, GGML_TYPE_F32);
         e = ggml_add(ctx, e, ggml_reshape_3d(ctx, m, n_kv, n_tps, n_stream));
         out = ggml_top_k(ctx, e, width);
         ggml_set_name(out, "out");
@@ -6897,24 +6907,90 @@ struct test_topk_qsa : public test_case {
             }
             if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> data(ggml_nelements(t));
-                for (auto & v : data) { v = rand() % n_blocks; }
+                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
+                    data[i] = masked_ties ? (i % n_kv)/4 % n_blocks : rand() % n_blocks;
+                }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
             } else if (t->type == GGML_TYPE_F16) {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     for (int64_t i = 0; i < n_kv; i++) {
-                        data[r * n_kv + i] = ggml_fp32_to_fp16((float) i);
+                        const float value = masked_ties ? (i < n_kv - 17 - r % n_tps ? 0.0f : -INFINITY) : (float) i;
+                        data[r * n_kv + i] = ggml_fp32_to_fp16(value);
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
             } else {
-                init_tensor_uniform(t, 0.0f, 0.5f);
+                if (t == mask && mask_type == GGML_TYPE_F32) {
+                    std::vector<float> data(ggml_nelements(t));
+                    for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                        for (int64_t cell = 0; cell < n_kv; ++cell) {
+                            data[row*n_kv + cell] = cell < n_kv - 17 - row % n_tps ? 0.0f : -INFINITY;
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                } else if (masked_ties) {
+                    std::vector<float> data(ggml_nelements(t));
+                    for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
+                        data[i] = (float) ((i % n_blocks)/2 % 13 - 7);
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                } else {
+                    init_tensor_uniform(t, 0.0f, 0.5f);
+                }
             }
         }
     }
 
     // top-k output order is unspecified; compare as a set of indices
     double err(const float * a, const float * b, size_t n) override {
+        if (masked_ties) {
+            std::vector<float> score_values(ggml_nelements(scores));
+            std::vector<int32_t> cell_values(ggml_nelements(cells));
+            std::vector<float> mask_values(ggml_nelements(mask));
+            ggml_backend_tensor_get(scores, score_values.data(), 0, score_values.size()*sizeof(float));
+            ggml_backend_tensor_get(cells, cell_values.data(), 0, cell_values.size()*sizeof(int32_t));
+            if (mask_type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> half_values(mask_values.size());
+                ggml_backend_tensor_get(mask, half_values.data(), 0, half_values.size()*sizeof(ggml_fp16_t));
+                for (size_t i = 0; i < half_values.size(); ++i) {
+                    mask_values[i] = ggml_fp16_to_fp32(half_values[i]);
+                }
+            } else {
+                ggml_backend_tensor_get(mask, mask_values.data(), 0, mask_values.size()*sizeof(float));
+            }
+            GGML_ASSERT(n == (size_t) (width*n_tps*n_stream));
+            double diff = 0.0;
+            for (int64_t row = 0; row < n_tps*n_stream; ++row) {
+                std::vector<float> values_a(width), values_b(width);
+                std::vector<int32_t> ids_a(width), ids_b(width);
+                for (int k = 0; k < width; ++k) {
+                    const int ia = (int) a[row*width + k];
+                    const int ib = (int) b[row*width + k];
+                    if (ia < 0 || ia >= n_kv || ib < 0 || ib >= n_kv ||
+                            a[row*width + k] != ia || b[row*width + k] != ib) {
+                        return 1.0;
+                    }
+                    auto value = [&](int cell) {
+                        const int block = cell_values[(row/n_tps)*n_kv + cell];
+                        return score_values[row*n_blocks + block] + mask_values[row*n_kv + cell];
+                    };
+                    values_a[k] = value(ia);
+                    values_b[k] = value(ib);
+                    ids_a[k] = ia;
+                    ids_b[k] = ib;
+                }
+                std::sort(values_a.begin(), values_a.end());
+                std::sort(values_b.begin(), values_b.end());
+                std::sort(ids_a.begin(), ids_a.end());
+                std::sort(ids_b.begin(), ids_b.end());
+                // 同点の選択順は問わず、値の一致と重複のないcell選択を確認する
+                diff += values_a != values_b;
+                diff += std::adjacent_find(ids_a.begin(), ids_a.end()) != ids_a.end();
+                diff += std::adjacent_find(ids_b.begin(), ids_b.end()) != ids_b.end();
+            }
+            return diff;
+        }
         std::vector<int32_t> ia(n), ib(n);
         double diff = 0.0;
         for (size_t i = 0; i < n; i++) {
@@ -10806,6 +10882,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    test_cases.emplace_back(new test_topk_qsa(1024, 4096, 1, 1, 2051, true));
+    test_cases.emplace_back(new test_topk_qsa(16384, 65536, 1, 1, 2051, true));
+    test_cases.emplace_back(new test_topk_qsa(512, 2048, 4, 2, 33, true));
+    test_cases.emplace_back(new test_topk_qsa(1024, 4096, 1, 1, 2051, true, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_topk_qsa(16384, 65536, 1, 1, 2051, true, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_topk_qsa(512, 2048, 4, 2, 33, true, GGML_TYPE_F32));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
@@ -11313,6 +11395,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int64_t n_kv : {4096, 65536}) {
+        for (int64_t n_tokens : {1, 256}) {
+            test_cases.emplace_back(new test_topk_qsa(n_kv/4, n_kv, n_tokens, 1, 2051, true));
+        }
+    }
 
     // 同時使用数を固定し、expert全体の作業集合を変えて測る
     for (int n_mats : {16, 512}) {
