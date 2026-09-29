@@ -5020,6 +5020,36 @@ static void ggml_compute_forward_get_rows_q(
     }
 }
 
+static void ggml_compute_forward_get_rows_mean4_f16(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t nblocks = dst->ne[1];
+    const int64_t nrows = ggml_nrows(dst);
+    const int64_t dr = (nrows + params->nth - 1)/params->nth;
+
+    for (int64_t i = dr*params->ith; i < MIN(dr*(params->ith + 1), nrows); ++i) {
+        const int64_t stream = i/nblocks;
+        const int64_t block = i % nblocks;
+        const int32_t * indices = (const int32_t *) ((const char *) src1->data + 4*block*src1->nb[0] + stream*src1->nb[1]);
+        const ggml_fp16_t * rows[4];
+        for (int j = 0; j < 4; ++j) {
+            const int32_t index = *(const int32_t *) ((const char *) indices + j*src1->nb[0]);
+            GGML_ASSERT(index >= 0 && index < src0->ne[1]);
+            rows[j] = (const ggml_fp16_t *) ((const char *) src0->data + index*src0->nb[1] + stream*src0->nb[2]);
+        }
+        float * output = (float *) ((char *) dst->data + block*dst->nb[1] + stream*dst->nb[2]);
+        for (int64_t col = 0; col < dst->ne[0]; ++col) {
+            float sum = GGML_FP16_TO_FP32(rows[0][col]);
+            sum += GGML_FP16_TO_FP32(rows[1][col]);
+            sum += GGML_FP16_TO_FP32(rows[2][col]);
+            sum += GGML_FP16_TO_FP32(rows[3][col]);
+            output[col] = sum*0.25f;
+        }
+    }
+}
+
 static void ggml_compute_forward_get_rows_f16(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -5148,6 +5178,12 @@ void ggml_compute_forward_get_rows(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+
+    if (ggml_get_op_params_i32(dst, 0) == 4) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F16);
+        ggml_compute_forward_get_rows_mean4_f16(params, dst);
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:

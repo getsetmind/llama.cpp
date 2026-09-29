@@ -2441,6 +2441,38 @@ struct test_get_rows : public test_case {
     }
 };
 
+struct test_get_rows_mean4 : public test_get_rows {
+    test_get_rows_mean4(int blocks, int streams, bool source_view, bool index_view)
+        : test_get_rows(GGML_TYPE_F16, 128, blocks*4 + 17, blocks*4, streams, 1, index_view, source_view) {}
+
+    std::string vars() override {
+        return test_get_rows::vars() + ",mean4=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in;
+        if (vs0) {
+            ggml_tensor * padded = ggml_new_tensor_4d(ctx, type, n + 3, m + 3, be1, 1);
+            in = ggml_view_4d(ctx, padded, n, m, be1, 1,
+                             padded->nb[1], padded->nb[2], padded->nb[3],
+                             3*padded->nb[0] + 3*padded->nb[1]);
+        } else {
+            in = ggml_new_tensor_4d(ctx, type, n, m, be1, 1);
+        }
+        ggml_set_name(in, "mean4_input");
+
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, v ? r + 1 : r, be1, 1);
+        if (v) {
+            rows = ggml_view_3d(ctx, rows, r, be1, 1, rows->nb[1], rows->nb[2], rows->nb[0]);
+        }
+        ggml_set_name(rows, "mean4_rows");
+
+        ggml_tensor * out = ggml_get_rows_mean4(ctx, in, rows);
+        ggml_set_name(out, "mean4_output");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -9243,6 +9275,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+
+    for (int blocks : {1, 17, 12480}) {
+        for (int streams : {1, 3, 12}) {
+            for (bool source_view : {false, true}) {
+                for (bool index_view : {false, true}) {
+                    test_cases.emplace_back(new test_get_rows_mean4(blocks, streams, source_view, index_view));
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

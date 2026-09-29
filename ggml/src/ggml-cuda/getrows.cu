@@ -129,6 +129,84 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_scalar(
+        const src0_t * src0, const int32_t * src1, dst_t * dst,
+        const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t n = ne10*ne11*(int64_t)ne12_fdv.z;
+    for (int64_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        const int64_t i10 = i % ne10;
+        const uint2 dm = fast_div_modulo((uint32_t)(i/ne10), ne12_fdv);
+        const int64_t i11 = dm.x;
+        const int64_t i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        const src0_t * src_row = (const src0_t *)((const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        dst[i10*s1 + i11*s2 + i12*s3] = ggml_cuda_cast<dst_t>(src_row[0]);
+    }
+}
+
+static __global__ void k_get_rows_half4(
+        const half * src0, const int32_t * src1, float * dst,
+        const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t i10 = 4*(int64_t)blockIdx.x + threadIdx.x/32;
+    if (i10 >= ne10) {
+        return;
+    }
+    const int lane = threadIdx.x % 32;
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        const half * src_row = (const half *)((const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        float * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        for (int j = 0; j < 4; ++j) {
+            const int col = lane + 32*j;
+            dst_row[col] = ggml_cuda_cast<float>(src_row[col]);
+        }
+    }
+}
+
+static __global__ void k_get_rows_mean4_f16(
+        const half * src0, const int32_t * src1, float * dst,
+        const int64_t ncols, const int64_t nblocks,
+        const size_t nb01, const size_t nb02,
+        const size_t nb10, const size_t nb11,
+        const size_t nb1, const size_t nb2) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t block = blockIdx.x;
+    const int64_t stream = blockIdx.y;
+    if (block >= nblocks) {
+        return;
+    }
+
+    const char * indices = (const char *) src1 + 4*block*nb10 + stream*nb11;
+    const half * rows[4];
+    for (int i = 0; i < 4; ++i) {
+        const int32_t index = *(const int32_t *) (indices + i*nb10);
+        rows[i] = (const half *) ((const char *) src0 + index*nb01 + stream*nb02);
+    }
+    float * output = (float *) ((char *) dst + block*nb1 + stream*nb2);
+    for (int64_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+        float sum = __half2float(rows[0][col]);
+        sum += __half2float(rows[1][col]);
+        sum += __half2float(rows[2][col]);
+        sum += __half2float(rows[3][col]);
+        output[col] = sum*0.25f;
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -253,6 +331,34 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    if (ne00 == 1) {
+        const int64_t n = ne10*ne11*ne12;
+        const dim3 block_nums(MIN((n + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, UINT16_MAX), 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_float_scalar<src0_t, dst_t>, launch_params,
+            src0_d, src1_d, dst_d,
+            ne10, ne11, ne12_fdv,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+        return;
+    }
+
+    if constexpr (std::is_same<src0_t, half>::value && std::is_same<dst_t, float>::value) {
+        if (ne00 == 128) {
+            const dim3 half_block_dims(128, 1, 1);
+            const dim3 half_block_nums((ne10 + 3)/4, 1, MIN(ne11*ne12, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{half_block_nums, half_block_dims, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_half4, launch_params,
+                (const half *)src0_d, src1_d, (float *)dst_d,
+                ne10, ne11, ne12_fdv,
+                s1, s2, s3,
+                nb01, nb02, nb03,
+                s10, s11, s12);
+            return;
+        }
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
@@ -444,6 +550,19 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
 
     cudaStream_t stream = ctx.stream();
+
+    if (ggml_get_op_params_i32(dst, 0) == 4) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(src0->nb[0] == sizeof(half) && src1->nb[0] == sizeof(int32_t));
+        const dim3 block_nums(dst->ne[1], dst->ne[2], 1);
+        const dim3 block_dims(128, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_mean4_f16, launch_params,
+            (const half *) src0->data, (const int32_t *) src1->data, (float *) dst->data,
+            dst->ne[0], dst->ne[1], src0->nb[1], src0->nb[2],
+            src1->nb[0], src1->nb[1], dst->nb[1], dst->nb[2]);
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
