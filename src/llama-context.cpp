@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -390,6 +391,7 @@ llama_context::llama_context(
             /*.type_v    =*/ params.type_v,
             /*.swa_full  =*/ params.swa_full,
             /*.keep_recurrent_on_device =*/ params.keep_recurrent_on_device,
+            /*.cache_qsa_indexer        =*/ params.cache_qsa_indexer,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
@@ -1394,7 +1396,9 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    auto * idx_ctx = dynamic_cast<llama_memory_hybrid_idx_context *>(mctx);
     if (mctx && !mctx->apply()) {
+        if (idx_ctx) { idx_ctx->finish_pool(false); }
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1432,12 +1436,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
+            if (idx_ctx) { idx_ctx->finish_pool(false); }
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            if (idx_ctx) { idx_ctx->finish_pool(false); }
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1457,6 +1463,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx_context *>(mctx)) {
+        idx->finish_pool(status == GGML_STATUS_SUCCESS && gtype == LLM_GRAPH_TYPE_DEFAULT);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3747,6 +3756,7 @@ llama_context_params llama_context_default_params() {
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.keep_recurrent_on_device    =*/ false,
+        /*.cache_qsa_indexer           =*/ false,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,

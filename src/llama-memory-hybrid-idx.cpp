@@ -39,7 +39,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
     const layer_filter_cb & filter_idx,
-                     bool   keep_recurrent_on_device) :
+                     bool   keep_recurrent_on_device,
+                     bool   cache_qsa_indexer) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
@@ -66,7 +67,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()),
+    mem_idx_pool(!cache_qsa_indexer || !mem_idx || mem_idx->get_n_stream() != 1 ? nullptr :
+        new llama_kv_cache(
+            model, hparams_idx, GGML_TYPE_F32, GGML_TYPE_F32, false, offload, true,
+            (kv_size + 3)/4, n_seq_max, 1, 0, LLAMA_SWA_TYPE_NONE,
+            nullptr, [&](uint32_t il) {
+                return filter_idx(il) && model.hparams.dsv4_compress_ratios[il] == 4;
+            }, nullptr, nullptr, "idx_pool_")) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -138,10 +146,15 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
-    return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
+    auto res = std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
+    if (res->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) {
+        invalidate_pool();
+    }
+    return res;
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
+    invalidate_pool();
     llama_memory_hybrid::clear(data);
 
     if (mem_idx) {
@@ -150,6 +163,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    invalidate_pool();
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
@@ -163,6 +177,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    invalidate_pool();
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -171,6 +186,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+    invalidate_pool();
     llama_memory_hybrid::seq_keep(seq_id);
 
     if (mem_idx) {
@@ -179,6 +195,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    invalidate_pool();
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
@@ -187,6 +204,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    invalidate_pool();
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
@@ -199,6 +217,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 
     if (mem_idx) {
         for (const auto & buft_size : mem_idx->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
+
+    if (mem_idx_pool) {
+        for (const auto & buft_size : mem_idx_pool->memory_breakdown()) {
             mb[buft_size.first] += buft_size.second;
         }
     }
@@ -220,6 +244,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    invalidate_pool();
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
@@ -252,6 +277,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+    invalidate_pool();
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
         clear(true);
@@ -269,6 +295,59 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx_pool() const {
+    return mem_idx_pool.get();
+}
+
+void llama_memory_hybrid_idx::invalidate_pool() {
+    pool_valid = false;
+}
+
+bool llama_memory_hybrid_idx::pool_incremental(const llama_ubatch & ubatch, uint32_t n_kv) const {
+    if (!pool_valid || ubatch.n_tokens != 1 || ubatch.n_seq_id[0] != 1 ||
+        ubatch.seq_id[0][0] != pool_seq || ubatch.pos[0] != pool_end || n_kv != pool_n_kv) {
+        return false;
+    }
+    const auto & cells = mem_idx->get_cells(pool_seq);
+    return (uint32_t) pool_end < cells.size() && !cells.is_empty(pool_end) &&
+        cells.pos_get(pool_end) == pool_end && cells.seq_get_all(pool_end).count() == 1 &&
+        cells.seq_has(pool_end, pool_seq);
+}
+
+void llama_memory_hybrid_idx::finish_pool(const llama_ubatch & ubatch, uint32_t n_kv, bool success) {
+    if (!mem_idx_pool) {
+        return;
+    }
+    if (!success || ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 || ubatch.n_seq_id[0] != 1) {
+        LLAMA_LOG_DEBUG("%s: invalid batch success=%d tokens=%u seqs=%u ids=%d\n", __func__, success, ubatch.n_tokens, ubatch.n_seqs_unq, ubatch.n_seq_id[0]);
+        invalidate_pool();
+        return;
+    }
+    const bool incremental = pool_incremental(ubatch, n_kv);
+    const llama_seq_id seq = ubatch.seq_id[0][0];
+    const llama_pos end = ubatch.pos[ubatch.n_tokens - 1] + 1;
+    const auto & cells = mem_idx->get_cells(seq);
+    if (end <= 0 || (uint32_t) end != cells.get_used() || cells.used_min() != 0 || cells.used_max_p1() != (uint32_t) end) {
+        LLAMA_LOG_DEBUG("%s: non-prefix end=%d used=%u min=%u max=%u\n", __func__, end, cells.get_used(), cells.used_min(), cells.used_max_p1());
+        invalidate_pool();
+        return;
+    }
+    if (!incremental) {
+        for (llama_pos i = 0; i < end; ++i) {
+            if (cells.pos_get(i) != i || cells.seq_get_all(i).count() != 1 || !cells.seq_has(i, seq)) {
+                LLAMA_LOG_DEBUG("%s: non-dense cell=%d pos=%d seqs=%zu\n", __func__, i, cells.pos_get(i), cells.seq_get_all(i).count());
+                invalidate_pool();
+                return;
+            }
+        }
+    }
+    pool_valid = true;
+    pool_seq = seq;
+    pool_end = end;
+    pool_n_kv = n_kv;
+    LLAMA_LOG_DEBUG("%s: seq=%d end=%d n_kv=%u incremental=%d\n", __func__, seq, end, n_kv, incremental);
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(
@@ -638,7 +717,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     mem(mem),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)),
+    has_ubatch(true) {}
 
 bool llama_memory_hybrid_idx_context::next() {
     if (ctx_idx) {
@@ -662,6 +742,20 @@ bool llama_memory_hybrid_idx_context::apply() {
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+}
+
+llama_kv_cache * llama_memory_hybrid_idx_context::get_idx_pool() const {
+    return mem ? mem->get_mem_idx_pool() : nullptr;
+}
+
+bool llama_memory_hybrid_idx_context::pool_incremental() const {
+    return has_ubatch && ctx_idx && mem->pool_incremental(get_ubatch(), get_idx()->get_n_kv());
+}
+
+void llama_memory_hybrid_idx_context::finish_pool(bool success) {
+    if (has_ubatch && ctx_idx) {
+        mem->finish_pool(get_ubatch(), get_idx()->get_n_kv(), success);
+    }
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {

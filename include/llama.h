@@ -405,6 +405,7 @@ extern "C" {
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool keep_recurrent_on_device; // KVをCPUへ置く場合もhybridのrecurrent stateをGPUに残す
+        bool cache_qsa_indexer; // 確定済みQSA blockの正規化とRoPE結果を再利用する
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)

@@ -97,6 +97,7 @@ static void usage(char ** argv) {
     LOG("  --cpu-kv                Keep the attention KV cache on CPU\n");
     LOG("  --keep-recurrent-on-device Keep hybrid recurrent state on the model device\n");
     LOG("  --decode-one    Compare one decode token after prefill\n");
+    LOG("  --cache-qsa-indexer Test eight decode steps and state restoration with pooled keys\n");
     LOG("  --sparse-indexer Use a 32-token indexer budget in backend tests\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -467,7 +468,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        bool cpu_kv = false, bool keep_recurrent_on_device = false) {
+        bool cpu_kv = false, bool keep_recurrent_on_device = false, bool cache_qsa_indexer = false, bool rollback_snapshots = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -482,6 +483,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     ctx_params.offload_kqv = !cpu_kv;
     ctx_params.keep_recurrent_on_device = keep_recurrent_on_device;
+    ctx_params.cache_qsa_indexer = cache_qsa_indexer;
+    ctx_params.n_rs_seq = cache_qsa_indexer || rollback_snapshots ? 1 : 0;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -501,7 +504,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false, bool decode_one = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false, bool decode_one = false, bool test_pool = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
@@ -532,14 +535,50 @@ static std::vector<float> get_logits(
     }
     if (decode_one && !encode) {
         GGML_ASSERT(n_tokens > 0 && n_tokens < n_ctx);
-        batch.n_tokens = 0;
-        common_batch_add(batch, tokens.back(), n_tokens, {0}, true);
-        if (llama_decode(lctx, batch)) {
-            llama_batch_free(batch);
-            throw std::runtime_error("failed to decode single token");
+        std::vector<uint8_t> state;
+        if (test_pool) {
+            state.resize(llama_state_get_size(lctx));
+            state.resize(llama_state_get_data(lctx, state.data(), state.size()));
         }
-        const float * logits = llama_get_logits_ith(lctx, 0);
-        ret.insert(ret.end(), logits, logits + n_vocab);
+        const uint32_t steps = test_pool ? 8 : 1;
+        const auto decode_steps = [&]() {
+            std::vector<float> logits;
+            for (uint32_t step = 0; step < steps; ++step) {
+                batch.n_tokens = 0;
+                common_batch_add(batch, tokens.back(), n_tokens + step, {0}, true);
+                if (llama_decode(lctx, batch)) {
+                    throw std::runtime_error("failed to decode single token");
+                }
+                const float * row = llama_get_logits_ith(lctx, 0);
+                logits.insert(logits.end(), row, row + n_vocab);
+            }
+            return logits;
+        };
+        const auto decoded = decode_steps();
+        ret.insert(ret.end(), decoded.begin(), decoded.end());
+        if (test_pool) {
+            if (llama_n_rs_seq(lctx) > 0) {
+                if (!llama_memory_seq_rm(llama_get_memory(lctx), 0, n_tokens + steps - 1, -1)) {
+                    throw std::runtime_error("pooled indexer rollback refused");
+                }
+                batch.n_tokens = 0;
+                common_batch_add(batch, tokens.back(), n_tokens + steps - 1, {0}, true);
+                if (llama_decode(lctx, batch)) {
+                    throw std::runtime_error("pooled indexer rollback decode failed");
+                }
+                const float * row = llama_get_logits_ith(lctx, 0);
+                const std::vector<float> restored(row, row + n_vocab);
+                const std::vector<float> previous(decoded.end() - n_vocab, decoded.end());
+                const double rollback_nmse = nmse(previous, restored);
+                LOG("rollback NMSE %.2e\n", rollback_nmse);
+                if (rollback_nmse > 1e-8) {
+                    throw std::runtime_error("pooled indexer rollback mismatch");
+                }
+            }
+            if (llama_state_set_data(lctx, state.data(), state.size()) != state.size() || decode_steps() != decoded) {
+                throw std::runtime_error("pooled indexer state restoration mismatch");
+            }
+        }
     }
     llama_batch_free(batch);
     return ret;
@@ -730,7 +769,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
 }
 
 static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend,
-        bool cpu_kv, bool keep_recurrent_on_device, bool decode_one, uint32_t indexer_top_k) {
+        bool cpu_kv, bool keep_recurrent_on_device, bool decode_one, uint32_t indexer_top_k, bool cache_qsa_indexer) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -858,18 +897,19 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 bool test_ok = true;
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode, decode_one);
+                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode, false, false, false, cache_qsa_indexer);
+                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode, decode_one, cache_qsa_indexer);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, cpu_kv, keep_recurrent_on_device);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode, decode_one);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, cpu_kv, keep_recurrent_on_device, cache_qsa_indexer);
+                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode, decode_one, cache_qsa_indexer);
                         double nmse_val = nmse(logits_cpu, logits_dev);
                         if (decode_one && !encode) {
                             const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx_cpu.first.get()));
-                            const std::vector<float> decode_cpu(logits_cpu.end() - n_vocab, logits_cpu.end());
-                            const std::vector<float> decode_dev(logits_dev.end() - n_vocab, logits_dev.end());
+                            const size_t n_decode = n_vocab*(cache_qsa_indexer ? 8 : 1);
+                            const std::vector<float> decode_cpu(logits_cpu.end() - n_decode, logits_cpu.end());
+                            const std::vector<float> decode_dev(logits_dev.end() - n_decode, logits_dev.end());
                             nmse_val = std::max(nmse_val, nmse(decode_cpu, decode_dev));
                         }
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -892,9 +932,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, cpu_kv, keep_recurrent_on_device);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, cpu_kv, keep_recurrent_on_device, cache_qsa_indexer);
                         const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode, decode_one);
+                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode, decode_one, cache_qsa_indexer);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
@@ -948,6 +988,7 @@ int main(int argc, char ** argv) {
     bool cpu_kv = false;
     bool keep_recurrent_on_device = false;
     bool decode_one = false;
+    bool cache_qsa_indexer = false;
     uint32_t indexer_top_k = 131072;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -959,6 +1000,9 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--sparse-indexer") == 0) {
             indexer_top_k = 32;
         } else if (strcmp(argv[i], "--decode-one") == 0) {
+            decode_one = true;
+        } else if (strcmp(argv[i], "--cache-qsa-indexer") == 0) {
+            cache_qsa_indexer = true;
             decode_one = true;
         } else if (strcmp(argv[i], "--cpu-kv") == 0) {
             cpu_kv = true;
@@ -1040,7 +1084,7 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity, target_backend, cpu_kv, keep_recurrent_on_device, decode_one, indexer_top_k);
+        return test_backends(arch_filter, seed, stdev, verbosity, target_backend, cpu_kv, keep_recurrent_on_device, decode_one, indexer_top_k, cache_qsa_indexer);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

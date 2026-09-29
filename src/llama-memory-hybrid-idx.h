@@ -38,7 +38,8 @@ public:
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx,
-                     bool   keep_recurrent_on_device = false);
+                     bool   keep_recurrent_on_device = false,
+                     bool   cache_qsa_indexer = false);
 
     ~llama_memory_hybrid_idx() = default;
 
@@ -75,6 +76,10 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+    llama_kv_cache * get_mem_idx_pool() const;
+    bool pool_incremental(const llama_ubatch & ubatch, uint32_t n_kv) const;
+    void finish_pool(const llama_ubatch & ubatch, uint32_t n_kv, bool success);
+    void invalidate_pool();
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
@@ -98,6 +103,11 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+    const std::unique_ptr<llama_kv_cache> mem_idx_pool;
+    bool pool_valid = false;
+    llama_seq_id pool_seq = -1;
+    llama_pos pool_end = 0;
+    uint32_t pool_n_kv = 0;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -138,6 +148,9 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+    llama_kv_cache * get_idx_pool() const;
+    bool pool_incremental() const;
+    void finish_pool(bool success);
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
@@ -147,7 +160,7 @@ public:
                        bool blk_bias) const;
 
 private:
-    const llama_memory_hybrid_idx * mem = nullptr;
+    llama_memory_hybrid_idx * mem = nullptr;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
@@ -158,4 +171,5 @@ private:
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
+    bool has_ubatch = false;
 };

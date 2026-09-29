@@ -2421,7 +2421,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.keep_recurrent_on_device = true;
         }
-    ).set_env("LLAMA_ARG_KEEP_RECURRENT_ON_DEVICE"));
+      ).set_env("LLAMA_ARG_KEEP_RECURRENT_ON_DEVICE"));
+    add_opt(common_arg(
+        {"--cache-qsa-indexer"},
+        "reuse normalized and rotated QSA block keys during single-sequence decoding",
+        [](common_params & params) {
+            params.cache_qsa_indexer = true;
+        }
+    ).set_env("LLAMA_ARG_CACHE_QSA_INDEXER"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
