@@ -94,6 +94,10 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --cpu-kv                Keep the attention KV cache on CPU\n");
+    LOG("  --keep-recurrent-on-device Keep hybrid recurrent state on the model device\n");
+    LOG("  --decode-one    Compare one decode token after prefill\n");
+    LOG("  --sparse-indexer Use a 32-token indexer budget in backend tests\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -113,7 +117,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, uint32_t indexer_top_k = 131072) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -329,7 +333,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     // note: using a realistic top-k here makes the results unstable and hard to match between CPU and GPU
     //       a large value makes things deterministic since all data is selected by the indexer
     //ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(131072));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        indexer_top_k);
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
@@ -462,7 +466,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        bool cpu_kv = false, bool keep_recurrent_on_device = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -475,6 +480,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.offload_kqv = !cpu_kv;
+    ctx_params.keep_recurrent_on_device = keep_recurrent_on_device;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -494,7 +501,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false, bool decode_one = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
@@ -522,6 +529,17 @@ static std::vector<float> get_logits(
         for (uint32_t j = 0; j < n_vocab; j++) {
             ret.push_back(logits_ith[j]);
         }
+    }
+    if (decode_one && !encode) {
+        GGML_ASSERT(n_tokens > 0 && n_tokens < n_ctx);
+        batch.n_tokens = 0;
+        common_batch_add(batch, tokens.back(), n_tokens, {0}, true);
+        if (llama_decode(lctx, batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("failed to decode single token");
+        }
+        const float * logits = llama_get_logits_ith(lctx, 0);
+        ret.insert(ret.end(), logits, logits + n_vocab);
     }
     llama_batch_free(batch);
     return ret;
@@ -711,7 +729,8 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
     return 0;
 }
 
-static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
+static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend,
+        bool cpu_kv, bool keep_recurrent_on_device, bool decode_one, uint32_t indexer_top_k) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -817,7 +836,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 continue;
             }
             const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, indexer_top_k);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
@@ -840,13 +859,19 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode, decode_one);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
-                        const double nmse_val = nmse(logits_cpu, logits_dev);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, cpu_kv, keep_recurrent_on_device);
+                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode, decode_one);
+                        double nmse_val = nmse(logits_cpu, logits_dev);
+                        if (decode_one && !encode) {
+                            const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx_cpu.first.get()));
+                            const std::vector<float> decode_cpu(logits_cpu.end() - n_vocab, logits_cpu.end());
+                            const std::vector<float> decode_dev(logits_dev.end() - n_vocab, logits_dev.end());
+                            nmse_val = std::max(nmse_val, nmse(decode_cpu, decode_dev));
+                        }
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
                         if (nmse_val > 1e-4) {
@@ -867,9 +892,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, cpu_kv, keep_recurrent_on_device);
                         const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode, decode_one);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
@@ -920,6 +945,10 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool cpu_kv = false;
+    bool keep_recurrent_on_device = false;
+    bool decode_one = false;
+    uint32_t indexer_top_k = 131072;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -927,6 +956,14 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
+        } else if (strcmp(argv[i], "--sparse-indexer") == 0) {
+            indexer_top_k = 32;
+        } else if (strcmp(argv[i], "--decode-one") == 0) {
+            decode_one = true;
+        } else if (strcmp(argv[i], "--cpu-kv") == 0) {
+            cpu_kv = true;
+        } else if (strcmp(argv[i], "--keep-recurrent-on-device") == 0) {
+            keep_recurrent_on_device = true;
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -1003,7 +1040,7 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        return test_backends(arch_filter, seed, stdev, verbosity, target_backend, cpu_kv, keep_recurrent_on_device, decode_one, indexer_top_k);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

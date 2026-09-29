@@ -1281,6 +1281,31 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
+        if (tensor->op == GGML_OP_FLASH_ATTN_EXT && split_dim == GGML_BACKEND_SPLIT_AXIS_1 && t_ij->src[0]->ne[2] > 0) {
+            const auto q_split = ggml_backend_meta_get_split_state(tensor->src[0], true);
+            GGML_ASSERT(q_split.axis == GGML_BACKEND_SPLIT_AXIS_2 && q_split.n_segments == 1 && q_split.nr[0] == 1);
+            int64_t q_head_offset = 0;
+            for (size_t k = 0; k < j; k++) {
+                q_head_offset += q_split.ne[k];
+            }
+            for (int i = 1; i <= 2; i++) {
+                ggml_tensor * kv = t_ij->src[i];
+                if (kv->ne[2] == 1 || (ggml_backend_buffer_is_meta(tensor->src[i]->buffer) &&
+                        ggml_backend_meta_get_split_state(tensor->src[i], true).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
+                    continue;
+                }
+                // CPU由来の複製KVから、各GPUのqueryに対応するheadだけを参照する
+                GGML_ASSERT(tensor->src[0]->ne[2] % kv->ne[2] == 0);
+                const int64_t n_gqa = tensor->src[0]->ne[2] / kv->ne[2];
+                GGML_ASSERT(q_head_offset % n_gqa == 0 && t_ij->src[0]->ne[2] % n_gqa == 0);
+                ggml_tensor * kv_view = ggml_view_4d(simple_ctx, kv, kv->ne[0], kv->ne[1],
+                        t_ij->src[0]->ne[2] / n_gqa, kv->ne[3], kv->nb[1], kv->nb[2], kv->nb[3],
+                        (q_head_offset / n_gqa) * kv->nb[2]);
+                GGML_ASSERT(ggml_backend_view_init(kv_view) == GGML_STATUS_SUCCESS);
+                t_ij->src[i] = kv_view;
+            }
+        }
+
         simple_tensors.push_back(t_ij);
     }
 
@@ -2016,9 +2041,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (node->view_src != nullptr && ggml_backend_buffer_is_host(node->buffer)) {
+                    // ホスト上のviewは演算を伴わず、デバイス別tensorへ分解する必要がない
                     bcj.nodes[i] = node;
                     continue;
                 }
@@ -2149,7 +2173,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
 
-                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    if (next->view_src != nullptr && ggml_backend_buffer_is_host(next->buffer)) {
                         continue;
                     }
                     if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -2188,7 +2212,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (node->view_src != nullptr && ggml_backend_buffer_is_host(node->buffer)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);

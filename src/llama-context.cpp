@@ -389,6 +389,7 @@ llama_context::llama_context(
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
             /*.swa_full  =*/ params.swa_full,
+            /*.keep_recurrent_on_device =*/ params.keep_recurrent_on_device,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
@@ -2604,6 +2605,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        if (strncmp(name, "qsa_host_", 9) == 0) {
+            GGML_ASSERT(backend_cpu && ggml_backend_supports_op(backend_cpu, cur));
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+        }
+
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
@@ -3740,6 +3746,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
+        /*.keep_recurrent_on_device    =*/ false,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,

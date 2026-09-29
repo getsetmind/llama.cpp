@@ -39,7 +39,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                     bool   keep_recurrent_on_device = false);
 
     ~llama_memory_hybrid_iswa() = default;
 

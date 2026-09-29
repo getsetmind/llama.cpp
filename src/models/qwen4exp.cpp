@@ -975,6 +975,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    // RAM上で参照先を絞り、decodeごとのKV全体転送を避ける
+    if (!cparams.offload_kqv && cparams.flash_attn && n_tokens == 1 && kq_mask->ne[3] == 1 && hparams.f_max_alibi_bias == 0.0f) {
+        ggml_tensor * indices = ggml_reshape_3d(ctx0, top_k, top_k->ne[0], 1, 1);
+        // 同点のscoreによる列順の揺れを除き、元のcache順に揃える
+        ggml_tensor * positions = ggml_cast(ctx0, indices, GGML_TYPE_F32);
+        cb(positions, "qsa_host_positions", il);
+        ggml_tensor * order = ggml_argsort(ctx0, positions, GGML_SORT_ORDER_ASC);
+        cb(order, "qsa_host_order", il);
+        indices = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, indices, 1, indices->ne[0], 1), order);
+        cb(indices, "qsa_host_indices", il);
+        indices = ggml_reshape_3d(ctx0, indices, indices->ne[1], 1, 1);
+        auto gather = [&](ggml_tensor * cache, const char * name) {
+            cache = ggml_permute(ctx0, cache, 0, 2, 1, 3);
+            ggml_tensor * heads = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, indices->ne[0], cache->ne[2], 1);
+            heads = ggml_repeat(ctx0, indices, heads);
+            ggml_tensor * selected = ggml_get_rows(ctx0, cache, heads);
+            cb(selected, name, il);
+            selected = ggml_cast(ctx0, selected, GGML_TYPE_F16);
+            cb(selected, name, il);
+            selected = ggml_cont(ctx0, ggml_permute(ctx0, selected, 0, 2, 1, 3));
+            cb(selected, name, il);
+            return selected;
+        };
+        ggml_tensor * k = gather(mctx_cur->get_k(ctx0, il), "qsa_host_k");
+        ggml_tensor * v = gather(mctx_cur->get_v(ctx0, il), "qsa_host_v");
+        ggml_tensor * mask = ggml_view_3d(ctx0, kq_mask, 1, kq_mask->ne[0], 1, kq_mask->nb[0], kq_mask->nb[1], 0);
+        mask = ggml_get_rows(ctx0, mask, indices);
+        cb(mask, "qsa_host_mask", il);
+        mask = ggml_reshape_2d(ctx0, mask, indices->ne[0], 1);
+        mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        cb(mask, "qsa_host_mask", il);
+
+        ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+        return cur;
+    }
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 

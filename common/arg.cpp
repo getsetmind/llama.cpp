@@ -2416,6 +2416,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--keep-recurrent-on-device"},
+        "keep hybrid recurrent state on the model device when KV cache offloading is disabled",
+        [](common_params & params) {
+            params.keep_recurrent_on_device = true;
+        }
+    ).set_env("LLAMA_ARG_KEEP_RECURRENT_ON_DEVICE"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

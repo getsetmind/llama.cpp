@@ -29,7 +29,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                     bool   keep_recurrent_on_device) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -54,7 +55,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         model,
         type_r,
         type_s,
-        offload,
+        offload || keep_recurrent_on_device,
         rs_size,
         n_seq_max,
         n_rs_seq,
