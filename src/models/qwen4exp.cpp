@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <cinttypes>
 
+// [TAG_QWEN4_REIMPLEMENT]
+// TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -732,13 +735,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool incremental) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias), incremental(incremental) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool incremental, bool causal_attn) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), incremental(incremental), causal_attn(causal_attn) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
         if (pool_cells) {
             const int64_t n_blocks = blk_cells->ne[0]/ratio;
             const int64_t n_updates = pool_dst->ne[0];
@@ -802,6 +805,9 @@ public:
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
     const bool incremental;
+
+    // causal_attnはgraph再利用の判定に含まれ、graphの寿命中は変わらない
+    const bool causal_attn;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -832,11 +838,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // only the "which block is visible" half of the bias varies per block
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
-    // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
+    // alibi writes distances instead of a mask, so it opts out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
     const bool blk_bias = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
-        cparams.causal_attn && !hparams.use_alibi;
+        !hparams.use_alibi;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -845,7 +851,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, incremental);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, incremental, cparams.causal_attn);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
