@@ -1657,6 +1657,11 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
+        // 複合演算は末端opだけを複製せず、graph全体の時間を測る
+        if (run_whole_graph()) {
+            n_runs = 1;
+        }
+
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
@@ -7281,6 +7286,12 @@ struct test_mul_mat_vec_fusion : public test_case {
         }
     }
 
+    void reinit_perf_iter(ggml_context * ctx) override {
+        if (use_id) {
+            init_mul_mat_id_ids(ctx, n_mats);
+        }
+    }
+
     double max_nmse_err() override {
         return 5e-3;
     }
@@ -11302,6 +11313,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // 同時使用数を固定し、expert全体の作業集合を変えて測る
+    for (int n_mats : {16, 512}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP,
+            1, 640, 2560, true, n_mats, 10, false, false, true, false, {1, 1}));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
