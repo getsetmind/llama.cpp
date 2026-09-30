@@ -1121,8 +1121,9 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
 #define VDR_IQ2_S_Q8_1_MMVQ 2
 #define VDR_IQ2_S_Q8_1_MMQ  2
 
-static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_grid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint64_t * __restrict__ grid) {
 
     const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
 
@@ -1141,7 +1142,7 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     int sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+        const int * grid_pos = (const int *)(grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
@@ -1164,6 +1165,11 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_iq2_s_q8_1_grid(vbq, bq8_1, kbx, iqs, iq2s_grid);
 }
 
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
