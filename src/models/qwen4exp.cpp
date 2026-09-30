@@ -1526,6 +1526,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_set_name(emb, "ple_rows");
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
@@ -1542,6 +1543,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
 
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);
     ggml_tensor * value = build_lora_mm(model.layers[il].ple_value, emb);
+    ggml_format_name(key, "ple_key_proj-%d", il);
+    ggml_format_name(value, "ple_value_proj-%d", il);
 
     // both norms group over one hc stream, with a [n_embd, hc] weight
     auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
@@ -1551,6 +1554,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
 
     key = grouped_norm(key, model.layers[il].ple_norm_key);
     ggml_tensor * query = grouped_norm(hidden, model.layers[il].ple_norm_query);
+    ggml_format_name(key, "ple_key_norm-%d", il);
+    ggml_format_name(query, "ple_query_norm-%d", il);
 
     // per-stream dot product, then a signed square root before the sigmoid
     ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, key, query));
@@ -1571,6 +1576,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             ggml_reshape_2d(ctx0, gated, hc_dim, n_tokens),
             model.layers[il].ple_norm_conv);
     normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
+    ggml_format_name(normalized, "ple_conv_norm-%d", il);
 
     // depthwise causal conv, dilated by the n-gram size, as a sum of shifted copies
     // ggml_conv_1d_dw is documented as unreliable:
@@ -1616,6 +1622,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     }
 
     conv_out = ggml_silu(ctx0, conv_out);
+    ggml_format_name(conv_out, "ple_conv_silu-%d", il);
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 

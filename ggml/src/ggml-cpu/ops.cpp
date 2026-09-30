@@ -11,6 +11,13 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 
 // ggml_compute_forward_dup
 
@@ -5178,6 +5185,48 @@ void ggml_compute_forward_get_rows(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+
+    struct ple_rows_trace {
+        const ggml_compute_params * params;
+        const ggml_tensor * dst;
+        bool enabled;
+        int64_t started;
+#if defined(__linux__)
+        struct rusage usage_before;
+#endif
+
+        ~ple_rows_trace() {
+            if (!enabled) {
+                return;
+            }
+#if defined(__linux__)
+            struct rusage usage_after = {};
+            getrusage(RUSAGE_THREAD, &usage_after);
+            const long minor_faults = usage_after.ru_minflt - usage_before.ru_minflt;
+            const long major_faults = usage_after.ru_majflt - usage_before.ru_majflt;
+#else
+            const long minor_faults = 0;
+            const long major_faults = 0;
+#endif
+            std::fprintf(stderr, "PLE_ROWS_TRACE thread=%d/%d rows=%lld us=%lld minor=%ld major=%ld\n",
+                    params->ith, params->nth, (long long) ggml_nelements(dst->src[1]),
+                    (long long) (ggml_time_us() - started), minor_faults, major_faults);
+        }
+    };
+
+    static const bool trace_ple_rows = std::getenv("GGML_PLE_ROWS_TRACE") != nullptr;
+    ple_rows_trace trace = {params, dst, trace_ple_rows && std::strstr(src0->name, "per_layer_token_embd") != nullptr,
+                            0
+#if defined(__linux__)
+                            , {}
+#endif
+    };
+    if (trace.enabled) {
+        trace.started = ggml_time_us();
+#if defined(__linux__)
+        getrusage(RUSAGE_THREAD, &trace.usage_before);
+#endif
+    }
 
     if (ggml_get_op_params_i32(dst, 0) == 4) {
         GGML_ASSERT(src0->type == GGML_TYPE_F16);
