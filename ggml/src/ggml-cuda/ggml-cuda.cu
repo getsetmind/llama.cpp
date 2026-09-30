@@ -2970,7 +2970,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const bool          is_topk_qsa = false,
+                                                 const bool          diagnose_qsa = false) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3007,6 +3009,12 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                     continue;
                 }
 
+                // 融合で省くcastの自己参照は書込先であり、kernelが読む入力ではない
+                if (is_topk_qsa && src_idx == 1 && src == cgraph->nodes[j] && src->op == GGML_OP_CPY &&
+                        j < node_idx + node_count - 1) {
+                    continue;
+                }
+
                 if (nodes_overlap(dst, src)) {
                     bool found = false;
 
@@ -3018,6 +3026,10 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                     }
 
                     if (!found) {
+                        if (diagnose_qsa) {
+                            GGML_LOG_INFO("qsa_match_diag: overlap node_offset=%d src=%d op=%s name=%s dst=%s\n",
+                                j - node_idx, src_idx, ggml_op_name(src->op), src->name, dst->name);
+                        }
                         is_ok = false;
                         break;
                     }
@@ -3452,7 +3464,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_top_k_qsa_match match;
         if (ggml_cuda_match_top_k_qsa(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+            static const bool diagnose = getenv("GGML_CUDA_QSA_TOP_K_DIAG") != nullptr;
+            static std::atomic<int> diagnostics { 0 };
+            const bool log_match = diagnose && diagnostics.fetch_add(1) < 8;
+            const bool memory_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1, false, true, log_match);
+            if (log_match) {
+                GGML_LOG_INFO("qsa_match_diag: memory_ranges=%s nodes=%d name=%s\n",
+                    memory_ok ? "pass" : "reject", match.node_count, node->name);
+            }
+            if (memory_ok) {
                 ggml_cuda_op_top_k_qsa(*cuda_ctx, match);
                 return match.node_count - 1;
             }

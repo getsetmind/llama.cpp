@@ -286,9 +286,16 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
     }
     static const bool diagnose = getenv("GGML_CUDA_QSA_TOP_K_DIAG") != nullptr;
     static std::atomic<int> diagnostics { 0 };
-    if (diagnose && graph->nodes[index]->op == GGML_OP_GET_ROWS &&
+    const bool log_match = diagnose && graph->nodes[index]->op == GGML_OP_GET_ROWS &&
             graph->nodes[index]->src[0]->type == GGML_TYPE_F32 && graph->nodes[index]->src[0]->ne[0] <= 128 &&
-            diagnostics.fetch_add(1) < 4) {
+            diagnostics.fetch_add(1) < 4;
+    auto reject = [&](const char * reason, int offset = -1) {
+        if (log_match) {
+            GGML_LOG_INFO("qsa_match_diag: reject=%s offset=%d\n", reason, offset);
+        }
+        return false;
+    };
+    if (log_match) {
         GGML_LOG_INFO("qsa_match_diag: scores=%lld,%lld,%lld cells=%lld\n",
             (long long) graph->nodes[index]->src[0]->ne[0], (long long) graph->nodes[index]->src[0]->ne[1],
             (long long) graph->nodes[index]->src[0]->ne[2], (long long) graph->nodes[index]->src[1]->ne[0]);
@@ -296,10 +303,23 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
             const ggml_tensor * node = graph->nodes[index + offset];
             GGML_LOG_INFO("qsa_match_diag: offset=%d op=%s flags=%d uses=%d name=%s\n", offset,
                 ggml_op_name(node->op), node->flags, ggml_node_get_use_count(graph, index + offset), node->name);
+            auto log_tensor = [offset](const char * role, const ggml_tensor * tensor) {
+                if (tensor == nullptr) {
+                    return;
+                }
+                GGML_LOG_INFO("qsa_match_diag: offset=%d role=%s type=%s ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu\n",
+                    offset, role, ggml_type_name(tensor->type),
+                    (long long) tensor->ne[0], (long long) tensor->ne[1],
+                    (long long) tensor->ne[2], (long long) tensor->ne[3],
+                    tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
+            };
+            log_tensor("node", node);
+            log_tensor("src0", node->src[0]);
+            log_tensor("src1", node->src[1]);
         }
     }
     if (index + 4 >= graph->n_nodes) {
-        return false;
+        return reject("minimum_node_count");
     }
     const std::initializer_list<ggml_op> cast_ops = {
         GGML_OP_GET_ROWS, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_CPY,
@@ -315,21 +335,21 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
     const auto ops = mask_op == GGML_OP_CPY ? cast_ops : mask_op == GGML_OP_RESHAPE ? reshape_ops : ready_ops;
     const int last = index + (int) ops.size() - 1;
     if (last >= graph->n_nodes) {
-        return false;
+        return reject("pattern_node_count");
     }
     for (int offset = 0; offset < (int) ops.size(); ++offset) {
         const ggml_tensor * node = graph->nodes[index + offset];
         if (node->op != ops.begin()[offset] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            return false;
+            return reject("operation_or_compute_flag", offset);
         }
         // castのCPYは自身の書込先参照を含むので、外部への参照と区別する
         if (offset < (int) ops.size() - 1 && ((node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
                 ggml_node_get_use_count(graph, index + offset) != (node->op == GGML_OP_CPY ? 2 : 1))) {
-            return false;
+            return reject("output_or_use_count", offset);
         }
     }
     if (!ggml_check_edges(graph, index, { { 1, 0, 0 }, { 2, 0, 1 } })) {
-        return false;
+        return reject("gather_permute_cont_edges");
     }
     const ggml_tensor * gather = graph->nodes[index];
     const ggml_tensor * scores = gather->src[0];
@@ -338,13 +358,13 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
     const ggml_tensor * add = graph->nodes[last - 1];
     ggml_tensor * dst = graph->nodes[last];
     if (add->src[0] != expanded || dst->src[0] != add) {
-        return false;
+        return reject("add_topk_edges");
     }
     const ggml_tensor * mask = add->src[1];
     if (ops.size() != ready_ops.size()) {
         const ggml_tensor * reshaped = graph->nodes[last - 2];
         if (mask != reshaped) {
-            return false;
+            return reject("mask_reshape_edge");
         }
         mask = reshaped->src[0];
     }
@@ -352,36 +372,43 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
     if (ops.size() == cast_ops.size()) {
         const ggml_tensor * cast = graph->nodes[index + 3];
         if (mask != cast || cast->type != GGML_TYPE_F32 || cast->src[0]->type != GGML_TYPE_F16) {
-            return false;
+            return reject("mask_cast_edge_or_type");
         }
         mask = cast->src[0];
     } else if (mask->type != GGML_TYPE_F32) {
-        return false;
+        return reject("mask_type");
     }
     if (scores->type != GGML_TYPE_F32 || cells->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_I32 ||
             !ggml_is_contiguous(scores) || !ggml_is_contiguous(cells) || !ggml_is_contiguous(mask) ||
             !ggml_is_contiguous(expanded) || !ggml_is_contiguous(dst)) {
-        return false;
+        return reject("type_or_contiguity");
     }
     const int64_t n_tokens = scores->ne[0];
     const int64_t n_blocks = scores->ne[1];
     const int64_t n_streams = scores->ne[2];
     const int64_t n_cells = cells->ne[0];
+    // 複数queryでは単体測定で遅くなったため、確認済みの単一queryだけ融合する
+    if (n_tokens != 1) {
+        return reject("multiple_queries");
+    }
     if (scores->ne[3] != 1 || cells->ne[1] != n_streams || ggml_nrows(cells) != n_streams ||
             n_tokens <= 0 || n_blocks <= 0 || n_cells <= 0 || n_cells > INT_MAX ||
             ggml_nelements(mask) != n_cells*n_tokens*n_streams ||
             expanded->ne[0] != n_cells || expanded->ne[1] != n_tokens || expanded->ne[2] != n_streams || expanded->ne[3] != 1 ||
             !ggml_are_same_shape(expanded, add->src[1]) || !ggml_are_same_shape(expanded, add) ||
             dst->ne[1] != n_tokens || dst->ne[2] != n_streams || dst->ne[3] != 1 || dst->ne[0] <= 0 || dst->ne[0] > n_cells) {
-        return false;
+        return reject("shape");
     }
     // 展開後のcell軸とtoken軸が入れ替わっていることをstrideで確認する
     const ggml_tensor * permuted = graph->nodes[index + 1];
     if (permuted->ne[0] != n_cells || permuted->ne[1] != n_tokens || permuted->ne[2] != n_streams ||
             permuted->nb[0] != gather->nb[1] || permuted->nb[1] != gather->nb[0] || permuted->nb[2] != gather->nb[2]) {
-        return false;
+        return reject("permute_shape_or_stride");
     }
     match = { scores, cells, mask, dst, (int) ops.size() };
+    if (log_match) {
+        GGML_LOG_INFO("qsa_match_diag: matched nodes=%d\n", match.node_count);
+    }
     return true;
 #else
     GGML_UNUSED(graph);
