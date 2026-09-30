@@ -342,7 +342,7 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
         if (node->op != ops.begin()[offset] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return reject("operation_or_compute_flag", offset);
         }
-        // castのCPYは自身の書込先参照を含むので、外部への参照と区別する
+        // Treat the cast CPY self-reference separately from external references.
         if (offset < (int) ops.size() - 1 && ((node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
                 ggml_node_get_use_count(graph, index + offset) != (node->op == GGML_OP_CPY ? 2 : 1))) {
             return reject("output_or_use_count", offset);
@@ -368,7 +368,7 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
         }
         mask = reshaped->src[0];
     }
-    // maskのcastがCPUへ割り当てられた場合は、転送済みF32をそのまま読む
+    // If the mask cast runs on the CPU, read the transferred F32 tensor directly.
     if (ops.size() == cast_ops.size()) {
         const ggml_tensor * cast = graph->nodes[index + 3];
         if (mask != cast || cast->type != GGML_TYPE_F32 || cast->src[0]->type != GGML_TYPE_F16) {
@@ -387,7 +387,7 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
     const int64_t n_blocks = scores->ne[1];
     const int64_t n_streams = scores->ne[2];
     const int64_t n_cells = cells->ne[0];
-    // 複数queryでは単体測定で遅くなったため、確認済みの単一queryだけ融合する
+    // Fuse only the validated single-query case; multiple queries regressed in isolated tests.
     if (n_tokens != 1) {
         return reject("multiple_queries");
     }
@@ -399,7 +399,7 @@ bool ggml_cuda_match_top_k_qsa(const ggml_cgraph * graph, int index, ggml_cuda_t
             dst->ne[1] != n_tokens || dst->ne[2] != n_streams || dst->ne[3] != 1 || dst->ne[0] <= 0 || dst->ne[0] > n_cells) {
         return reject("shape");
     }
-    // 展開後のcell軸とtoken軸が入れ替わっていることをstrideで確認する
+    // Verify that the expanded cell and token axes are swapped by comparing strides.
     const ggml_tensor * permuted = graph->nodes[index + 1];
     if (permuted->ne[0] != n_cells || permuted->ne[1] != n_tokens || permuted->ne[2] != n_streams ||
             permuted->nb[0] != gather->nb[1] || permuted->nb[1] != gather->nb[0] || permuted->nb[2] != gather->nb[2]) {
