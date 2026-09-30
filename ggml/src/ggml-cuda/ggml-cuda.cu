@@ -92,6 +92,10 @@
 #include <string>
 #include <vector>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
@@ -4398,7 +4402,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                static const bool trace_nodes = getenv("GGML_CUDA_TRACE_NODES") != nullptr;
+                if (trace_nodes) {
+                    const std::string label = std::to_string(i) + ":" + ggml_op_name(node->op) + ":" + node->name;
+                    nvtxRangePushA(label.c_str());
+                }
+#endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                if (trace_nodes) {
+                    nvtxRangePop();
+                }
+#endif
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
