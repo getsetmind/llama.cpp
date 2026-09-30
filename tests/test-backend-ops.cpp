@@ -58,12 +58,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
+    const char * fixed_seed = std::getenv("GGML_TEST_FIXED_SEED");
+    static std::atomic<uint32_t> seed_index{0};
+    const uint32_t tensor_seed = fixed_seed ? uint32_t(std::strtoul(fixed_seed, nullptr, 10)) + seed_index++ : 0;
     {
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
         auto init_thread = [&](size_t start, size_t end) {
             thread_local std::default_random_engine gen(std::random_device{}());
+            if (fixed_seed) {
+                gen.seed(tensor_seed + uint32_t(start));
+            }
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -1535,6 +1541,15 @@ struct test_case {
                 }
             }
 
+            if (std::getenv("GGML_TEST_PRINT_FINGERPRINT") && ud->tc->op_desc(t1) == "MUL_MAT_VEC_FUSION") {
+                uint64_t hash = 14695981039346656037ULL;
+                for (float value : f1) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    hash = (hash ^ bits) * 1099511628211ULL;
+                }
+                printf("[LOOKUP-FP] %s %016" PRIx64 " ", ud->tc->vars().c_str(), hash);
+            }
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
@@ -5218,7 +5233,8 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
 
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
     std::random_device rd;
-    std::default_random_engine rng(rd());
+    const char * fixed_seed = std::getenv("GGML_TEST_FIXED_SEED");
+    std::default_random_engine rng(fixed_seed ? uint32_t(std::strtoul(fixed_seed, nullptr, 10)) : rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;
