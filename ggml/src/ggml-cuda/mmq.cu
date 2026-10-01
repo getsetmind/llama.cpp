@@ -299,8 +299,16 @@ void ggml_cuda_mul_mat_q(
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
     // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    // T4の疎なexpert入力でも平均割当を使う候補を比較できるようにする
+    static const int moe_tile_min = getenv("GGML_CUDA_MOE_AVG_TILE") != nullptr ?
+                                   std::atoi(getenv("GGML_CUDA_MOE_AVG_TILE")) : 0;
+    const bool t4_avg_tile = moe_tile_min > 0 && cc == GGML_CUDA_CC_TURING && ne02 > 1 &&
+                            (src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ4_NL);
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || t4_avg_tile) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+        if (t4_avg_tile) {
+            ncols_opt = std::max(ncols_opt, int64_t(std::min(moe_tile_min, 128)));
+        }
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
