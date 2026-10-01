@@ -230,6 +230,24 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
+    static const bool batched = getenv("GGML_CUDA_BATCHED_TOP_K") != nullptr &&
+                                std::atoi(getenv("GGML_CUDA_BATCHED_TOP_K")) != 0;
+    const int min_rows = ncols <= 1024 ? 2 : ncols <= 4096 ? 16 : 32;
+    if (batched && nrows >= min_rows && ncols <= 8192 &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_TURING) {
+        // 一時領域を抑えながら行ごとの起動をまとめる
+        const int chunk_nrows = std::min<int64_t>(nrows, (1 << 20) / (ncols * sizeof(int)));
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
+        int * tmp_dst = temp_dst_alloc.get();
+        for (int64_t row = 0; row < nrows; row += chunk_nrows) {
+            const int iter_nrows = std::min<int64_t>(chunk_nrows, nrows - row);
+            argsort_f32_i32_cuda_bitonic(src0_d + row * ncols, tmp_dst, ncols, iter_nrows,
+                                        GGML_SORT_ORDER_DESC, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(dst_d + row * k, k * sizeof(int), tmp_dst, ncols * sizeof(int),
+                                         k * sizeof(int), iter_nrows, cudaMemcpyDeviceToDevice, stream));
+        }
+        return;
+    }
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
     // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
