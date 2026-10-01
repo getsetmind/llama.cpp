@@ -202,6 +202,21 @@ jobs:
           export SLOW_TESTS="1"
           ./tests.sh
 
+  windows-cache-cleanup:
+    needs: windows
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Clone cleanup scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear
         env:
@@ -210,4 +225,4 @@ jobs:
           key: server-windows-2025-x64
           older: 5m
           min: 1
-          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+          dry-run: false
