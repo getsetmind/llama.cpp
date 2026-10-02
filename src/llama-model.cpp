@@ -816,7 +816,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            static const int64_t moe_granularity = [] {
+                const char * value = std::getenv("LLAMA_MOE_SPLIT_GRANULARITY");
+                const int requested = value ? std::atoi(value) : 128;
+                return requested == 32 || requested == 64 ? requested : 128;
+            }();
+            const int64_t granularity = tensor_name.find("_exps.") != std::string::npos ? moe_granularity : 128;
+            const int64_t blck_size_perf = std::lcm(blck_size, granularity);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }

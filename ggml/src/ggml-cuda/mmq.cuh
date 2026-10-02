@@ -227,6 +227,14 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_turing(ggml_type type, int J, bool fallback) {
+    // Smaller row tiles reduce padding for 160-row expert shards on SM75.
+    if (type == GGML_TYPE_IQ2_S && J == 32 && fallback) {
+        return ggml_cuda_mmq_config(type, 128, 2, 64, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+    }
+    return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+}
+
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1 = GGML_PREC_Q8) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
@@ -253,6 +261,11 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         }
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
+#if !defined(GGML_USE_MUSA)
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) {
+        return ggml_cuda_mmq_get_config_turing(type, J, fallback);
+    }
+#endif
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
@@ -284,6 +297,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+#elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    return ggml_cuda_mmq_get_config_turing(type, J, fallback);
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
