@@ -52,7 +52,7 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#if defined(CUB_TOP_K_AVAILABLE) || (!defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP))
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -212,7 +212,7 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#endif
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -230,6 +230,37 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
+    static const bool batched_radix = getenv("GGML_CUDA_BATCHED_TOP_K_RADIX") != nullptr &&
+                                      std::atoi(getenv("GGML_CUDA_BATCHED_TOP_K_RADIX")) != 0;
+    if (batched_radix && nrows >= 32 && ncols > 16384 && ncols <= 65536 &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_TURING) {
+        // 行をまとめて選択し、histogramの一時領域を4 MiB以内に抑える
+        const int blocks_per_row = std::min<int64_t>((ncols + 1023) / 1024, 64);
+        const int chunk_nrows = std::min<int64_t>(nrows, (1 << 22) / (blocks_per_row * 256 * sizeof(int)));
+        for (int64_t row = 0; row < nrows; row += chunk_nrows) {
+            const int iter_nrows = std::min<int64_t>(chunk_nrows, nrows - row);
+            top_k_radix_cuda(pool, src0_d + row * ncols, dst_d + row * k, ncols, iter_nrows, k, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    static const bool batched_wide = getenv("GGML_CUDA_BATCHED_TOP_K_WIDE") != nullptr &&
+                                     std::atoi(getenv("GGML_CUDA_BATCHED_TOP_K_WIDE")) != 0;
+    if (batched_wide && nrows >= 32 && ncols > 8192 && ncols <= 16384 &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_TURING) {
+        // 長文の行別起動を減らし、sort用入力の一時領域を1 MiB以内に抑える
+        const int chunk_nrows = std::min<int64_t>(nrows, (1 << 20) / (ncols * sizeof(int)));
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
+        int * tmp_dst = temp_dst_alloc.get();
+        for (int64_t row = 0; row < nrows; row += chunk_nrows) {
+            const int iter_nrows = std::min<int64_t>(chunk_nrows, nrows - row);
+            argsort_f32_i32_cuda_cub(pool, src0_d + row * ncols, tmp_dst, ncols, iter_nrows,
+                                    GGML_SORT_ORDER_DESC, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(dst_d + row * k, k * sizeof(int), tmp_dst, ncols * sizeof(int),
+                                         k * sizeof(int), iter_nrows, cudaMemcpyDeviceToDevice, stream));
+        }
+        return;
+    }
     static const bool batched = getenv("GGML_CUDA_BATCHED_TOP_K") != nullptr &&
                                 std::atoi(getenv("GGML_CUDA_BATCHED_TOP_K")) != 0;
     const int min_rows = ncols <= 1024 ? 2 : ncols <= 4096 ? 16 : 32;
