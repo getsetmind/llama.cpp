@@ -300,8 +300,19 @@ void ggml_cuda_mul_mat_q(
     // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
     int64_t ncols_opt = ne12;
     // T4の疎なexpert入力でも平均割当を使う候補を比較できるようにする
-    static const int moe_tile_min = getenv("GGML_CUDA_MOE_AVG_TILE") != nullptr ?
-                                   std::atoi(getenv("GGML_CUDA_MOE_AVG_TILE")) : 0;
+    static const int moe_tile_default = getenv("GGML_CUDA_MOE_AVG_TILE") != nullptr ?
+                                       std::atoi(getenv("GGML_CUDA_MOE_AVG_TILE")) : 0;
+    static const int moe_iq2s_tile_min = getenv("GGML_CUDA_MOE_IQ2S_AVG_TILE") != nullptr ?
+                                       std::atoi(getenv("GGML_CUDA_MOE_IQ2S_AVG_TILE")) : moe_tile_default;
+    static const int moe_iq4nl_prefill_tile_min = getenv("GGML_CUDA_MOE_IQ4NL_PREFILL_TILE") != nullptr ?
+                                               std::atoi(getenv("GGML_CUDA_MOE_IQ4NL_PREFILL_TILE")) : moe_tile_default;
+    int moe_tile_min = moe_tile_default;
+    if (src0->type == GGML_TYPE_IQ2_S) {
+        moe_tile_min = moe_iq2s_tile_min;
+    } else if (src0->type == GGML_TYPE_IQ4_NL && ne12 >= 128) {
+        // 短いubatchでは既存の下限を維持してdown側の悪化を避ける
+        moe_tile_min = moe_iq4nl_prefill_tile_min;
+    }
     const bool t4_avg_tile = moe_tile_min > 0 && cc == GGML_CUDA_CC_TURING && ne02 > 1 &&
                             (src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ4_NL);
     if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || t4_avg_tile) {
