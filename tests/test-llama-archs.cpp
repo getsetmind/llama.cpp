@@ -601,7 +601,8 @@ static std::vector<float> get_logits(
 static bool check_causal_attn_toggle(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const uint32_t n_past   = tokens.size();
+    // decodeの追加tokenも含め、cacheの末尾より先から開始する
+    const uint32_t n_past   = llama_memory_seq_pos_max(llama_get_memory(lctx), 0) + 1;
     const uint32_t n_ubatch = llama_n_ubatch(lctx);
 
     GGML_ASSERT(n_past + n_ubatch/2 + n_ubatch <= llama_n_ctx(lctx));
