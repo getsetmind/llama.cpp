@@ -721,6 +721,7 @@ public:
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
     ggml_tensor * pool_mask     = nullptr; // F32 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
+    ggml_tensor * dump_idxs     = nullptr;
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_idxs_flat = nullptr;
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
@@ -910,8 +911,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
     ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
 
-    // dump rows n_kv + slot as a cumulative sum: the meta backend cannot split an arange, which has no source
-    ggml_tensor * dump  = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
+    // 同じ連番の計算を層間で共有する
+    ggml_tensor * dump = inp_kpool->dump_idxs;
+    if (!dump) {
+        dump = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
+        inp_kpool->dump_idxs = dump;
+    }
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
     idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
