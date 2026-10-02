@@ -722,6 +722,7 @@ public:
     ggml_tensor * pool_mask     = nullptr; // F32 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
+    ggml_tensor * new_pool_idxs_flat = nullptr;
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
 
@@ -766,6 +767,8 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
+    // 層ごとの別tensorによる重複転送を避ける
+    inp->new_pool_idxs_flat = ggml_reshape_1d(ctx0, inp->new_pool_idxs, kpool*inp->n_new);
     if (inp->cache_safe) {
         inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp->n_new);
         ggml_set_input(inp->new_pool_rep);
@@ -808,7 +811,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
 
     // pool only the blocks this ubatch completes or regroups
-    ggml_tensor * rows = kpool_cache.gather_key_gate(ggml_reshape_1d(ctx0, inp_kpool->new_pool_idxs, kpool*n_new));
+    ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_idxs_flat);
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 
     // mean over the members; kpool is small, so summing slices beats a transpose plus sum_rows
