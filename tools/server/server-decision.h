@@ -41,13 +41,20 @@ struct server_decision_context {
             case COMMON_DECISION_TYPE_OPENJEV:
             case COMMON_DECISION_TYPE_LEV:
             case COMMON_DECISION_TYPE_KEV:
+            case COMMON_DECISION_TYPE_NIMBLE:
                 return true;
             default:
                 return false;
         }
     }
 
+    // true if all the questions of a request go in one prompt, see fill_task_joint()
+    bool is_joint() const {
+        return type == COMMON_DECISION_TYPE_CLEF;
+    }
+
     // true if the prompt of the model has a place for images
+    // TODO: clef needs token and embedding entries in the same batch, see https://github.com/ggml-org/llama.cpp/pull/29622
     bool can_use_images() const {
         switch (type) {
             case COMMON_DECISION_TYPE_OPENJEV:
@@ -71,12 +78,16 @@ struct server_decision_context {
     // mctx is only used if there are files
     void fill_task(
             const json & state,
+            const std::vector<server_decision_question> & questions,
             const server_decision_question & question,
             size_t variant,
             const std::vector<raw_buffer> & files,
             mtmd_context * mctx,
             const mtmd_helper_init_opt & init_opt,
             server_task & task) const;
+
+    // set the prompt of all the questions, the result has the scores of all their options, in order
+    void fill_task_joint(const json & state, const std::vector<server_decision_question> & questions, server_task & task) const;
 
     // scores: the raw model outputs of each variant
     json format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores) const;
@@ -88,8 +99,9 @@ private:
     std::map<std::string, float> temperatures; // "<type>" or "<type>.<n_options bucket>"
     size_t n_options_max   = 0;
     bool   noul_true_first = false; // noul options are [true, false] instead of [false, true]
+    bool   choice_sorted   = false; // choice options are in the order of their keys
 
-    // OPENJEV, LEV
+    // OPENJEV, LEV, NIMBLE
     std::vector<llama_token> labels;
     std::vector<std::string> label_texts; // only if the label of an option is given to the template
 
@@ -100,7 +112,13 @@ private:
     size_t      max_head_tokens   = 0; // question + options
     size_t      max_option_tokens = 48;
 
-    std::string render(const json & state, const server_decision_question & question, size_t variant, size_t n_images) const;
+    std::string render(
+            const json & state,
+            const std::vector<server_decision_question> & questions,
+            const server_decision_question & question,
+            size_t variant,
+            size_t n_images) const;
+    json render_options(const server_decision_question & question, size_t variant) const;
     size_t n_outputs(const server_decision_question & question) const;
     void fill_task_laya(llama_tokens & tokens, const server_decision_question & question, server_task & task) const;
 
