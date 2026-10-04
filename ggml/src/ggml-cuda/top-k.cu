@@ -3,6 +3,7 @@
 
 #include <type_traits>
 #include <atomic>
+#include <cstdlib>
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -295,7 +296,23 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const size_t shared_mem     = ncols_pad * sizeof(int);
     const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
     const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+    // Limit input bytes per sort chunk; CUB scratch is allocated separately.
+    static const size_t sort_chunk_bytes = []() -> size_t {
+        const size_t default_bytes = 1 << 26;
+        const char * value = std::getenv("GGML_CUDA_TOP_K_SORT_CHUNK_MIB");
+        if (value == nullptr) {
+            return default_bytes;
+        }
+        char * end = nullptr;
+        const long mib = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || mib < 1 || mib > 64) {
+            GGML_LOG_WARN("ggml_cuda_op_top_k: ignoring invalid GGML_CUDA_TOP_K_SORT_CHUNK_MIB, expected 1..64\n");
+            return default_bytes;
+        }
+        GGML_LOG_INFO("ggml_cuda_op_top_k: CUB sort input chunk limit = %ld MiB\n", mib);
+        return (size_t) mib << 20;
+    }();
+    const int chunk_nrows = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows, sort_chunk_bytes);
 
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
     int *                     tmp_dst = temp_dst_alloc.get();
