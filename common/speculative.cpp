@@ -1438,6 +1438,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
+        char arch[64] = {0};
+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
+        chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        if (this->params.n_ctx > 0 && (is_mem_shared || chain_heads || n_seq != 1)) {
+            throw std::runtime_error("bounded MTP context requires one sequence and one unshared head");
+        }
+
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
@@ -1477,11 +1486,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-
-        char arch[64] = {0};
-        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
-        chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1538,6 +1542,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    bool trim_context(llama_seq_id seq_id, int64_t pos_last) {
+        if (params.n_ctx == 0) {
+            return true;
+        }
+
+        auto * mem = llama_get_memory(params.ctx_dft);
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem, seq_id);
+        const int64_t window = std::min<uint32_t>(params.n_ctx, llama_n_ctx_seq(params.ctx_dft));
+        const int64_t keep_from = pos_last + 1 - window;
+        if (pos_min < 0 || keep_from <= pos_min) {
+            return true;
+        }
+
+        // Amortize indexer pool rebuilds without shifting absolute positions.
+        const int64_t chunk = std::max<int64_t>(1, window / 16);
+        const llama_pos p1 = (llama_pos) (((keep_from + chunk - 1) / chunk) * chunk);
+        if (!llama_memory_seq_rm(mem, seq_id, 0, p1)) {
+            SPC_ERR("failed to trim MTP context for seq_id=%d before pos=%d\n", seq_id, p1);
+            return false;
+        }
+        SPC_DBG("MTP context trim: seq_id=%d, keep_from=%d, window=%" PRId64 "\n", seq_id, p1, window);
+        return true;
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1572,6 +1600,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] >= 0 && !trim_context(seq_id,
+                        (int64_t) batch_in.tokens[i_batch_end[seq_id]].pos[0] + params.n_max)) {
+                    return false;
+                }
+            }
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1680,6 +1714,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            if (!trim_context(seq_id, (int64_t) dp.pos0 + params.n_max)) {
+                return;
+            }
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
@@ -2613,8 +2650,20 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
-    // the draft context holds as many tokens per sequence as the target context
+    // By default the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    if (params.speculative.draft.n_ctx > 0) {
+        if (!spec_mtp || params.n_parallel != 1) {
+            LOG_ERR("%s: bounded draft context requires single-sequence draft-mtp\n", __func__);
+            return;
+        }
+        cparams.n_ctx = std::min<uint32_t>(cparams.n_ctx, params.speculative.draft.n_ctx);
+        const int64_t usable = cparams.n_ctx - cparams.n_ctx / 16;
+        if (usable <= (int64_t) llama_n_batch(ctx_tgt) + params.speculative.draft.n_max) {
+            LOG_ERR("%s: draft context must fit a target batch, draft tokens and eviction slack\n", __func__);
+            return;
+        }
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?

@@ -171,6 +171,10 @@ void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
+    // An MTP wrapper may have no recurrent layers, only position bookkeeping.
+    if (mem_recr->is_empty()) {
+        return mem_attn->seq_pos_min(seq_id);
+    }
     // the min of the total cache is the max of the two caches' min values
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
 }

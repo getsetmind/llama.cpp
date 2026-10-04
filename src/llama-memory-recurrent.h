@@ -61,6 +61,9 @@ public:
 
     bool get_can_shift() const override;
 
+    // true if no layers - can happen if the layer filter removes all layers
+    bool is_empty() const;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -122,9 +125,6 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
-
-    // true if no layers - can happen if the layer filter removes all layers
-    bool is_empty() const;
 
     size_t total_size() const;
 
