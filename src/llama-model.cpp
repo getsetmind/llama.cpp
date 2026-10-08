@@ -828,11 +828,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            static const int64_t moe_granularity = [] {
-                const char * value = std::getenv("LLAMA_MOE_SPLIT_GRANULARITY");
-                const int requested = value ? std::atoi(value) : 128;
-                return requested == 32 || requested == 64 ? requested : 128;
-            }();
+            const int64_t moe_granularity = ud->model->moe_split_granularity();
             const int64_t granularity = tensor_name.find("_exps.") != std::string::npos ? moe_granularity : 128;
             const int64_t blck_size_perf = std::lcm(blck_size, granularity);
             GGML_ASSERT(segments.size() == 1);
@@ -1293,6 +1289,15 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (this->params.moe_split_granularity == 0) {
+        const char * value = std::getenv("LLAMA_MOE_SPLIT_GRANULARITY");
+        const int requested = value ? std::atoi(value) : 128;
+        this->params.moe_split_granularity = requested == 32 || requested == 64 ? requested : 128;
+    }
+    if (this->params.moe_split_granularity != 32 && this->params.moe_split_granularity != 64 &&
+        this->params.moe_split_granularity != 128) {
+        throw std::invalid_argument("MoE split granularity must be 32, 64, or 128");
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -2019,6 +2024,10 @@ size_t llama_model::n_devices() const {
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+int32_t llama_model::moe_split_granularity() const {
+    return params.moe_split_granularity;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -2954,6 +2963,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
