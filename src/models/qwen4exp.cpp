@@ -193,10 +193,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    // an MTP-only file carries the MTP block, the embeddings and the LM head, but no trunk
-    const bool mtp_only    = n_layer_nextn > 0 && ml.get_weight(tn(LLM_TENSOR_HC_ATTN_NORM, "weight", 0).str().c_str()) == nullptr;
-    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    const int  mtp_flags   = ml.load_mtp ? 0 : TENSOR_SKIP;
+    const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
@@ -430,10 +429,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
-    cb(inpL, "model.input_embed", -1);
-    ggml_build_forward_expand(gf, inpL);
-
     auto * inp = build_inp_mem_hybrid();
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
@@ -446,6 +441,17 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 "the indexer cache must track the attention cache cell for cell");
     }
 
+    ggml_tensor * ple_emb = nullptr;
+    if (hparams.ple_n_heads > 0) {
+        ple_emb = build_inp_ple(mctx_hyb);
+        // make sure ple_emb and build_inp_embd are in the same graph split
+        ggml_build_forward_expand(gf, ple_emb);
+    }
+
+    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+    cb(inpL, "model.input_embed", -1);
+    ggml_build_forward_expand(gf, inpL);
+
     // the QSA layers share one set of k-pool inputs
     // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
     llm_graph_input_kpool * inp_kpool = nullptr;
@@ -455,13 +461,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
-        ple_emb = build_inp_ple(mctx_hyb);
-        // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
-    }
 
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
@@ -565,24 +564,29 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd_out());
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-    if (tok_embd_w == nullptr) {
-        tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
-        GGML_ASSERT(tok_embd_w);
+    ggml_tensor * tok_embd;
+    if (ubatch.token) {
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        if (tok_embd_w == nullptr) {
+            tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
+            GGML_ASSERT(tok_embd_w);
+        }
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    } else {
+        tok_embd = inp->embd;
     }
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h = inp->h;
